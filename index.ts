@@ -1,25 +1,33 @@
 /**
- * MemGraph Plugin for OpenClaw — Embedding-driven recall
+ * MemGraph Plugin — Fully local, embedding-driven long-term memory
  *
- * Behavior:
- *   - Auto ingest: after each LLM output, POST user+assistant to /ingest
- *   - Smart recall: every turn, check if query embedding points to turns
- *     not in current context. Only recall when needed (compressed/lost turns).
- *   - Context tracking: maintain set of turn_ids in current context window.
- *     Clear on session_start and after_compaction.
- *   - Manual recall: memgraph_recall tool always available.
+ * No external server needed. All logic runs in-process:
+ *   - Embedding: local ONNX model (all-MiniLM-L6-v2) via Transformers.js
+ *   - Storage: JSON file persistence
+ *   - Memo extraction: cheap LLM API (DeepSeek) — optional
+ *   - Recall: cosine similarity + focus decay, only from past sessions
  *
- * Key insight: embedding similarity is free (local model). LLM recall only
- * fires when matches point to compressed/lost content. No wasted recalls.
+ * Anti-token-explosion:
+ *   - Circular ingestion prevention (strip recall tags before ingest)
+ *   - Quality gate (skip low-value agent chatter)
+ *   - Session filtering (don't recall current session — it's in context)
+ *   - Recall cooldown (30s) + query cache
  */
 
-const MEMGRAPH_URL = process.env.MEMGRAPH_URL || "http://localhost:18821";
+import { embed } from "./lib/embedder.js";
+import { addTurn, totalTurns } from "./lib/store.js";
+import { extractMemos } from "./lib/memo.js";
+import { checkContext, recall } from "./lib/recall.js";
+import { stripRecallTags, combineTurnText } from "./lib/utils.js";
 
 // ── State ──
-// Track turn_ids that are in the current context window per session
 const contextTurnIds = new Map<string, Set<number>>();
-// Cache user prompt from llm_input to pair with llm_output
 const pendingPrompt = new Map<string, string>();
+
+// ── Recall cooldown + cache ──
+const RECALL_COOLDOWN_MS = 30_000; // 30 seconds
+const lastRecallTime = new Map<string, number>();
+const recallCache = new Map<string, { query: string; result: string; time: number }>();
 
 function getContextSet(sessionKey: string): Set<number> {
   if (!contextTurnIds.has(sessionKey)) {
@@ -28,39 +36,36 @@ function getContextSet(sessionKey: string): Set<number> {
   return contextTurnIds.get(sessionKey)!;
 }
 
-// ── HTTP helper ──
+// ── Ingest quality gate ──
 
-async function memgraphFetch(
-  path: string,
-  body?: any,
-  timeoutMs = 10000,
-): Promise<any> {
-  const url = `${MEMGRAPH_URL}${path}`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const resp = await fetch(url, {
-      method: body ? "POST" : "GET",
-      headers: { "Content-Type": "application/json" },
-      body: body ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
-    });
-    if (!resp.ok) {
-      throw new Error(`MemGraph ${resp.status} ${resp.statusText}`);
+const MIN_MEANINGFUL_LENGTH = 40;
+
+const NOISE_PATTERNS: RegExp[] = [
+  /^```[\s\S]*```$/,                       // pure code block
+  /^\s*\{[\s\S]*\}\s*$/,                   // raw JSON blob
+  /^(ok|done|sure|got it|understood|好的|明白|收到|完成|好|是的|没问题)\s*[.!。！]?\s*$/i,
+  /^(let me|i'll|i will|让我|我来|接下来|我先)/i,
+  /^(reading|searching|checking|looking|running|executing)/i,
+  /^\$ .+/,                                 // shell command
+  /^(Error|Warning|ECONNREFUSED|TypeError|SyntaxError)/i,
+];
+
+function isWorthIngesting(userText: string, assistantText: string): boolean {
+  const combined = `${userText} ${assistantText}`.trim();
+  if (combined.length < MIN_MEANINGFUL_LENGTH) return false;
+
+  for (const pat of NOISE_PATTERNS) {
+    if (pat.test(userText.trim()) || pat.test(assistantText.trim())) {
+      return false;
     }
-    return resp.json();
-  } finally {
-    clearTimeout(timer);
   }
-}
 
-async function isServerUp(): Promise<boolean> {
-  try {
-    await memgraphFetch("/health", undefined, 2000);
-    return true;
-  } catch {
+  const codeBlockContent = assistantText.match(/```[\s\S]*?```/g)?.join("") || "";
+  if (codeBlockContent.length > 0 && codeBlockContent.length / assistantText.length > 0.8) {
     return false;
   }
+
+  return true;
 }
 
 // ── Plugin ──
@@ -75,14 +80,13 @@ export default function register(api: any) {
       return {
         name: "memgraph_recall",
         description:
-          "Query long-term memory from previous sessions. Use to recall facts, preferences, decisions, or conversations from past sessions no longer in context. Requires MemGraph server running.",
+          "Query long-term memory from previous sessions. Use to recall facts, preferences, decisions, or conversations from past sessions no longer in context.",
         inputSchema: {
           type: "object",
           properties: {
             query: {
               type: "string",
-              description:
-                "Natural language query for what to recall from past sessions.",
+              description: "Natural language query for what to recall from past sessions.",
             },
             top_k: {
               type: "number",
@@ -95,32 +99,19 @@ export default function register(api: any) {
         },
         async handler(params: { query: string; top_k?: number }) {
           try {
-            const result = await memgraphFetch("/recall", {
-              query: params.query,
-              top_k: params.top_k ?? 10,
-            });
+            const sessionId = ctx.sessionKey || ctx.sessionId || "default";
+            const text = await recall(params.query, sessionId, params.top_k ?? 10);
             return {
               content: [
                 {
                   type: "text" as const,
-                  text: result.result_text || "(no memories found)",
+                  text: text || "(no memories found)",
                 },
               ],
             };
           } catch (err: any) {
-            const msg = err?.message || String(err);
-            if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed") || msg.includes("aborted")) {
-              return {
-                content: [
-                  {
-                    type: "text" as const,
-                    text: "MemGraph server is not running. Start it with: cd /root/memgraph && python3 -m memgraph.server",
-                  },
-                ],
-              };
-            }
             return {
-              content: [{ type: "text" as const, text: `MemGraph error: ${msg}` }],
+              content: [{ type: "text" as const, text: `MemGraph error: ${err?.message || err}` }],
             };
           }
         },
@@ -141,36 +132,44 @@ export default function register(api: any) {
   // ── Hook: auto ingest after each LLM output ──
 
   api.on("llm_output", async (event: any, ctx: any) => {
-    if (!(await isServerUp())) return;
-
-    // Get the user prompt cached from llm_input
     const key = ctx.sessionKey || event.sessionId || "default";
-    const userText = pendingPrompt.get(key) || "";
+    let userText = pendingPrompt.get(key) || "";
     pendingPrompt.delete(key);
 
     const assistantTexts: string[] = event.assistantTexts || [];
-    const assistantText = assistantTexts.join("\n");
+    let assistantText = assistantTexts.join("\n");
 
     if (!userText && !assistantText) return;
     if (assistantTexts.every((t: string) => !t.trim())) return;
-    // Also skip if user text is empty — can't extract meaningful memo
     if (!userText.trim()) return;
 
+    // Strip recalled memory to prevent circular ingestion
+    userText = stripRecallTags(userText);
+    assistantText = stripRecallTags(assistantText);
+    if (!userText && !assistantText) return;
+
+    // Quality gate: skip low-value agent chatter
+    if (!isWorthIngesting(userText, assistantText)) {
+      log.info(`[memgraph] skipped ingest — low-value content`);
+      return;
+    }
+
     try {
-      const result = await memgraphFetch("/ingest", {
-        user_text: userText || "",
-        assistant_text: assistantText || "",
-        session_id: ctx.sessionKey || ctx.sessionId,
-      });
+      // Generate embedding for this turn
+      const combined = combineTurnText(userText, assistantText);
+      const embedding = await embed(combined);
 
-      // Track the new turn_id in context
-      if (result.total_turns) {
-        const key = ctx.sessionKey || "default";
-        const turnId = result.total_turns - 1; // 0-indexed
-        getContextSet(key).add(turnId);
-      }
+      // Store the turn
+      const sessionId = ctx.sessionKey || ctx.sessionId || "default";
+      const turnId = addTurn(userText, assistantText, embedding, sessionId);
 
-      log.info(`[memgraph] ingested turn, total=${result.total_turns}`);
+      // Track in context
+      getContextSet(key).add(turnId);
+
+      log.info(`[memgraph] ingested turn ${turnId}, total=${totalTurns()}`);
+
+      // Fire-and-forget memo extraction (async, non-blocking)
+      extractMemos(userText, assistantText, turnId).catch(() => {});
     } catch (err: any) {
       log.warn(`[memgraph] ingest failed: ${err?.message || err}`);
     }
@@ -181,7 +180,9 @@ export default function register(api: any) {
   api.on("session_start", async (event: any, ctx: any) => {
     const key = ctx.sessionKey || event.sessionKey || "default";
     contextTurnIds.set(key, new Set());
-    log.info(`[memgraph] session_start → cleared context window for ${key}`);
+    lastRecallTime.delete(key);
+    recallCache.delete(key);
+    log.info(`[memgraph] session_start → cleared context for ${key}`);
   });
 
   // ── Hook: clear context window after compaction ──
@@ -189,57 +190,64 @@ export default function register(api: any) {
   api.on("after_compaction", async (event: any, ctx: any) => {
     const key = ctx.sessionKey || "default";
     contextTurnIds.set(key, new Set());
-    log.info(`[memgraph] after_compaction → cleared context window for ${key}`);
+    log.info(`[memgraph] after_compaction → cleared context for ${key}`);
   });
 
-  // ── Hook: embedding-driven smart recall ──
-  // Every turn: check if query points to turns not in context.
-  // Only inject recall when there are missing matches.
+  // ── Hook: smart recall with cooldown + session filtering ──
 
   api.on("before_prompt_build", async (event: any, ctx: any) => {
-    if (!(await isServerUp())) return;
-
     const key = ctx.sessionKey || "default";
     const query = event.prompt || "";
     if (!query) return;
 
+    const now = Date.now();
+
+    // Cooldown: skip if last recall was < 30s ago
+    const lastTime = lastRecallTime.get(key) || 0;
+    if (now - lastTime < RECALL_COOLDOWN_MS) {
+      return;
+    }
+
+    // Cache: if same query, reuse result
+    const cached = recallCache.get(key);
+    if (cached && cached.query === query && now - cached.time < RECALL_COOLDOWN_MS * 4) {
+      if (cached.result) {
+        return {
+          prependContext: `<memgraph_long_term_memory>\n${cached.result}\n</memgraph_long_term_memory>`,
+        };
+      }
+      return;
+    }
+
+    const sessionId = ctx.sessionKey || ctx.sessionId || "default";
     const ctxSet = getContextSet(key);
 
     try {
-      // Ask server: does this query point to turns outside our context?
-      const check = await memgraphFetch("/check_context", {
-        query,
-        context_turn_ids: Array.from(ctxSet),
-        top_k: 5,
-      });
+      // Check if recall is needed (any top matches from other sessions?)
+      const check = await checkContext(query, sessionId, ctxSet, 5);
 
-      if (!check.needs_recall) {
-        // All top matches are in context, no recall needed
+      if (!check.needsRecall) {
+        lastRecallTime.set(key, now);
+        recallCache.set(key, { query, result: "", time: now });
         return;
       }
 
-      log.info(
-        `[memgraph] Smart recall triggered: ${check.reason}`,
-      );
+      log.info(`[memgraph] Smart recall triggered: ${check.reason}`);
 
-      // Recall needed — fetch full recall result
-      const result = await memgraphFetch("/recall", {
-        query,
-        top_k: 10,
-      });
+      // Full recall — only past sessions
+      const text = await recall(query, sessionId, 10);
+      lastRecallTime.set(key, now);
+      recallCache.set(key, { query, result: text, time: now });
 
-      const text = result.result_text;
-      if (!text || text === "(no memories found)") return;
+      if (!text) return;
 
-      log.info(
-        `[memgraph] Injected ${text.length} chars of long-term memory`,
-      );
+      log.info(`[memgraph] Injected ${text.length} chars of long-term memory`);
 
       return {
         prependContext: `<memgraph_long_term_memory>\n${text}\n</memgraph_long_term_memory>`,
       };
     } catch (err: any) {
-      log.warn(`[memgraph] smart recall check failed: ${err?.message || err}`);
+      log.warn(`[memgraph] smart recall failed: ${err?.message || err}`);
     }
   });
 }
