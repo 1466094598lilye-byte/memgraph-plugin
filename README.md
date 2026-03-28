@@ -1,26 +1,4 @@
-# MemGraph
 
-Attention-routed conversation memory for LLMs. Achieves **92.1% recall** on a 10-persona benchmark — 3× higher than [mem0](https://github.com/mem0ai/mem0) (30.6%) and 4× higher than rolling-summary baselines (23.1%).
-
-## Benchmark Results
-
-Evaluated on [RealMem](tests/benchmark/realmem_data/) — 10 personas × 207 sessions × 126 ground-truth queries. Each query tests whether the system can recall specific facts from past conversations.
-
-| Method | Average Recall | Range |
-|--------|---------------:|------:|
-| **MemGraph (attention)** | **92.1%** | 84.0% – 103.1% |
-| mem0 | 30.6% | 23.1% – 38.5% |
-| summary | 23.1% | 2.5% – 38.8% |
-
-Per-persona and per-query breakdowns are available in the JSON result files under `tests/benchmark/`.
-
-> Recall >100% occurs when the judge credits the system for recalling related information beyond the ground-truth set. This is a known artifact of LLM-as-judge evaluation — see [Known Limitations](#known-limitations).
-
-### Baselines
-
-- **MemGraph (attention)** — AttentionRouter: memo full injection + cosine top-k selective recall + focus decay
-- **mem0** — [Mem0](https://github.com/mem0ai/mem0) production memory library. Stores sessions via `memory.add()`, retrieves via `memory.search()`
-- **summary** — Rolling summary baseline: LLM compresses each session into a running summary (similar to ChatGPT's conversation memory). Full summary used as context at query time
 
 ## How It Works
 
