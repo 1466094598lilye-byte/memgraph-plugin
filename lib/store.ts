@@ -26,6 +26,7 @@ interface StoreData {
   memos: MemoEntry[];
 }
 
+const EMBEDDING_DIM = 384;
 const DATA_DIR = join(dirname(__dirname), "data");
 const STORE_PATH = join(DATA_DIR, "store.json");
 
@@ -72,6 +73,11 @@ export function addTurn(
   embedding: number[],
   sessionId: string,
 ): number {
+  if (!Array.isArray(embedding) || embedding.length !== EMBEDDING_DIM) {
+    throw new Error(
+      `addTurn: embedding must be a ${EMBEDDING_DIM}-dim array, got ${Array.isArray(embedding) ? embedding.length : typeof embedding}`,
+    );
+  }
   ensureLoaded();
   const turn_id = store.turns.length;
   store.turns.push({
@@ -101,16 +107,16 @@ export function addMemos(entries: MemoEntry[]) {
   scheduleSave();
 }
 
-/** Get all turns */
+/** Get all turns (shallow copy — safe from external mutation) */
 export function getAllTurns(): Turn[] {
   ensureLoaded();
-  return store.turns;
+  return [...store.turns];
 }
 
-/** Get all memos */
+/** Get all memos (shallow copy — safe from external mutation) */
 export function getAllMemos(): MemoEntry[] {
   ensureLoaded();
-  return store.memos;
+  return [...store.memos];
 }
 
 /** Get total turn count */
