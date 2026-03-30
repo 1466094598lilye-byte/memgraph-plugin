@@ -5,9 +5,14 @@
   "author": "Lily Huang",
   "license": "MIT",
   "openclaw": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "dependencies": {
     "@huggingface/transformers": "^3.4.0"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.2"
   }
 }

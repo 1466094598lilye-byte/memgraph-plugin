@@ -25,12 +25,35 @@ interface ScoredTurn {
  * Check if a query points to turns outside the current context.
  * Returns true only if top matches belong to OTHER sessions.
  */
+// Quick pre-filter: skip embedding if query is clearly not about past context
+const RECALL_HINT_PATTERNS = [
+  /之前|上次|以前|记得|记忆|过去|历史/,        // Chinese
+  /before|previous|last time|remember|recall|earlier|history|past/i,  // English
+  /\?$|？$/,                                    // questions are more likely to need recall
+];
+
+function queryMightNeedRecall(query: string): boolean {
+  // Short operational commands never need recall
+  if (query.length < 20) return false;
+  // Explicit recall hints always qualify
+  if (RECALL_HINT_PATTERNS.some((p) => p.test(query))) return true;
+  // Longer queries (>100 chars) might be conversational — let them through
+  if (query.length > 100) return true;
+  // Default: skip — saves an embed() call
+  return false;
+}
+
 export async function checkContext(
   query: string,
   currentSessionId: string,
   contextTurnIds: Set<number>,
   topK: number = 5,
 ): Promise<{ needsRecall: boolean; reason: string }> {
+  // Pre-filter: avoid expensive embed() call for operational queries
+  if (!queryMightNeedRecall(query)) {
+    return { needsRecall: false, reason: "query doesn't suggest past context needed" };
+  }
+
   const turns = getAllTurns();
   if (turns.length === 0) {
     return { needsRecall: false, reason: "no turns stored" };
@@ -49,8 +72,9 @@ export async function checkContext(
   scored.sort((a, b) => b.score - a.score);
   const topMatches = scored.slice(0, topK);
 
-  // Only consider matches with meaningful similarity (above noise floor)
-  const MIN_SIMILARITY = 0.3;
+  // Only consider matches with strong similarity — 0.3 is noise floor,
+  // 0.55 filters out "vaguely related" matches that waste tokens
+  const MIN_SIMILARITY = 0.55;
   const meaningfulMatches = topMatches.filter((s) => s.score >= MIN_SIMILARITY);
 
   if (meaningfulMatches.length === 0) {

@@ -143,6 +143,12 @@ export default function register(api: any) {
     if (assistantTexts.every((t: string) => !t.trim())) return;
     if (!userText.trim()) return;
 
+    // Skip tool calls — they're not human conversation
+    if (event.isToolCall || event.type === "tool_call" || event.toolCalls?.length) {
+      log.info(`[memgraph] skipped ingest — tool call`);
+      return;
+    }
+
     // Strip recalled memory to prevent circular ingestion
     userText = stripRecallTags(userText);
     assistantText = stripRecallTags(assistantText);
